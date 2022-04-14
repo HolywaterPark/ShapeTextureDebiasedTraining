@@ -1,5 +1,3 @@
-python imagenet.py -a resnet50 --data /home/severance/ImageNet --epochs 50 --schedule 30 60 90 --checkpoint inference/ --gpu-id 0,1 --train-batch 128 --lr 0.2 --mixbn
-
 '''
 Training script for ImageNet
 Copyright (c) Wei YANG, 2017
