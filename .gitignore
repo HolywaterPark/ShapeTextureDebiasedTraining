@@ -10,6 +10,10 @@ test.eps
 dev
 monitor.py
 exp
+ILSVRC2012_devkit_t12*
+inference
+meta.bin
+val
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
