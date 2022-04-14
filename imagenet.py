@@ -1,3 +1,5 @@
+python imagenet.py -a resnet50 --data /home/severance/ImageNet --epochs 50 --schedule 30 60 90 --checkpoint inference/ --gpu-id 0,1 --train-batch 128 --lr 0.2 --mixbn
+
 '''
 Training script for ImageNet
 Copyright (c) Wei YANG, 2017
@@ -33,6 +35,7 @@ import torch.utils.data as data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+import torchvision
 from torch.optim.lr_scheduler import _LRScheduler
 
 import models.imagenet as customized_models
@@ -223,9 +226,20 @@ def main():
             norm_layer = MixBatchNorm2d
         else:
             norm_layer = None
-        model = models.__dict__[args.arch](num_classes=args.num_classes, norm_layer=norm_layer)
+        # model = models.__dict__[args.arch](num_classes=args.num_classes, norm_layer=norm_layer)
+        t_model = torchvision.models.resnet50(num_classes=args.num_classes, norm_layer=norm_layer)
+        from models.infodrop_resnet import infodrop_resnet50
+        # s_model = torchvision.models.resnet50(num_classes=args.num_classes, norm_layer=norm_layer)
+        s_model = infodrop_resnet50(num_classes=args.num_classes, norm_layer=norm_layer)
+        # from models.resnet import resnet50
+        # s_model = torchvision.models.resnet50(num_classes=args.num_classes, norm_layer=norm_layer)
 
-    model = torch.nn.DataParallel(model).cuda()
+
+    from models.cps_network import CPSNetwork
+    network = CPSNetwork(s_model=s_model, t_model=t_model)
+    # model = torch.nn.DataParallel(model).cuda()
+    model = torch.nn.DataParallel(network).cuda()
+
 
     cudnn.benchmark = True
     print('    Total params: %.2fM' % (sum(p.numel() for p in model.parameters()) / 1000000.0))
@@ -291,7 +305,7 @@ def main():
 
             model.load_state_dict(checkpoint['state_dict'])
         logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title)
-        logger.set_names(['Learning Rate', 'Train Loss', 'Valid Loss', 'Train Acc.', 'Valid Acc.'])
+        logger.set_names(['Learning Rate', 'S_Train Loss', 'T_Train Loss', 'S_Valid Loss', 'T_Valid Loss', 'S_Train Acc.', 'T_Train Acc.', 'S_Valid Acc.', 'T_Valid Acc.'])
 
     if args.finetune:
         for param in model.parameters():
@@ -343,26 +357,43 @@ def main():
                              style_transfer=style_transfer, writer=writer)
         if args.mixbn:
             model.apply(to_mix_status)
-            train_loss, train_acc, loss_main, loss_aux, top1_main, top1_aux = train_func()
+            ((s_train_loss, s_cps_loss, s_train_acc, s_loss_main, s_loss_aux, s_top1_main, s_top1_aux),
+            (t_train_loss, t_cps_loss, t_train_acc, t_loss_main, t_loss_aux, t_top1_main, t_top1_aux)) = train_func()
         else:
-            train_loss, train_acc = train_func()
-        writer.add_scalar('Train/loss', train_loss, epoch)
-        writer.add_scalar('Train/acc', train_acc, epoch)
+            (s_train_loss, s_train_acc), (t_train_loss, t_train_acc) = train_func()
+        writer.add_scalar('Train/loss_s', s_train_loss, epoch)
+        writer.add_scalar('Train/loss_cps_s', s_cps_loss, epoch)
+        writer.add_scalar('Train/acc_s', s_train_acc, epoch)
+        writer.add_scalar('Train/loss_t', t_train_loss, epoch)
+        writer.add_scalar('Train/loss_cps_t', t_cps_loss, epoch)
+        writer.add_scalar('Train/acc_t', t_train_acc, epoch)
 
         if args.mixbn:
-            writer.add_scalar('Train/loss_main', loss_main, epoch)
-            writer.add_scalar('Train/loss_aux', loss_aux, epoch)
-            writer.add_scalar('Train/acc_main', top1_main, epoch)
-            writer.add_scalar('Train/acc_aux', top1_aux, epoch)
+            writer.add_scalar('Train/loss_main_s', s_loss_main, epoch)
+            writer.add_scalar('Train/loss_aux_s', s_loss_aux, epoch)
+            writer.add_scalar('Train/acc_main_s', s_top1_main, epoch)
+            writer.add_scalar('Train/acc_aux_s', s_top1_aux, epoch)
+
+            writer.add_scalar('Train/loss_main_t', t_loss_main, epoch)
+            writer.add_scalar('Train/loss_aux_t', t_loss_aux, epoch)
+            writer.add_scalar('Train/acc_main_t', t_top1_main, epoch)
+            writer.add_scalar('Train/acc_aux_t', t_top1_aux, epoch)
             model.apply(to_clean_status)
-        test_loss, test_acc = test(val_loader, model, criterion, epoch, use_cuda)
-        writer.add_scalar('Test/loss', test_loss, epoch)
-        writer.add_scalar('Test/acc', test_acc, epoch)
+        s_test_loss, s_test_acc = test(val_loader, model, 1, criterion, epoch, use_cuda)
+        t_test_loss, t_test_acc = test(val_loader, model, 2, criterion, epoch, use_cuda)
+        writer.add_scalar('Test/loss_s', s_test_loss, epoch)
+        writer.add_scalar('Test/acc_s', s_test_acc, epoch)
+        writer.add_scalar('Test/loss_t', t_test_loss, epoch)
+        writer.add_scalar('Test/acc_s', t_test_acc, epoch)
 
         # append logger file
-        logger.append([state['lr'], train_loss, test_loss, train_acc, test_acc])
+        logger.append([state['lr'], s_train_loss, t_train_loss, s_test_loss, t_test_loss, s_train_acc, t_train_acc, s_test_acc, t_test_acc])
 
         # save model
+        test_acc = max(s_test_acc, t_test_acc)
+        is_shape = False
+        if test_acc == s_test_acc:
+            is_shape = True
         is_best = test_acc > best_acc
         best_acc = max(test_acc, best_acc)
         save_checkpoint({
@@ -371,7 +402,7 @@ def main():
             'acc': test_acc,
             'best_acc': best_acc,
             'optimizer': optimizer.state_dict(),
-        }, is_best, checkpoint=args.checkpoint)
+        }, is_best, is_shape, checkpoint=args.checkpoint)
 
     print('Best acc:')
     print(best_acc)
@@ -405,14 +436,23 @@ def train(train_loader, model, criterion, optimizer, epoch, use_cuda, warmup_sch
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
-    losses = AverageMeter()
-    top1 = AverageMeter()
-    top5 = AverageMeter()
+    s_losses = AverageMeter()
+    t_losses = AverageMeter()
+    s_cps_losses = AverageMeter()
+    t_cps_losses = AverageMeter()
+    s_top1 = AverageMeter()
+    t_top1 = AverageMeter()
+    s_top5 = AverageMeter()
+    t_top5 = AverageMeter()
     if mixbn:
-        losses_main = AverageMeter()
-        losses_aux = AverageMeter()
-        top1_main = AverageMeter()
-        top1_aux = AverageMeter()
+        s_losses_main = AverageMeter()
+        s_losses_aux = AverageMeter()
+        s_top1_main = AverageMeter()
+        s_top1_aux = AverageMeter()
+        t_losses_main = AverageMeter()
+        t_losses_aux = AverageMeter()
+        t_top1_main = AverageMeter()
+        t_top1_aux = AverageMeter()
     end = time.time()
 
     MEAN = torch.tensor([0.485, 0.456, 0.406]).cuda()
@@ -429,7 +469,6 @@ def train(train_loader, model, criterion, optimizer, epoch, use_cuda, warmup_sch
 
         if use_cuda:
             inputs, targets = inputs.cuda(), targets.cuda(non_blocking=True)
-        # inputs, targets = torch.autograd.Variable(inputs), torch.autograd.Variable(targets)
 
         if style_transfer is not None:
             if args.multi_grid:
@@ -464,47 +503,85 @@ def train(train_loader, model, criterion, optimizer, epoch, use_cuda, warmup_sch
 
         if not args.multi_grid:
             inputs = (inputs - MEAN[:, None, None]) / STD[:, None, None]
-            outputs = model(inputs)
+            s_outputs = model(inputs, step=1)
+            t_outputs = model(inputs, step=2)
         else:
             inputs = ((inputs[0] - MEAN[:, None, None]) / STD[:, None, None],
                       (inputs[1] - MEAN[:, None, None]) / STD[:, None, None])
             if args.mixbn:
                 model.apply(to_clean_status)
-            outputs1 = model(inputs[0])
+            s_outputs1 = model(inputs[0], step=1)
+            t_outputs1 = model(inputs[0], step=2)
             if args.mixbn:
                 model.apply(to_adv_status)
-            outputs2 = model(inputs[1])
-            outputs = torch.cat([outputs1, outputs2])
+            s_outputs2 = model(inputs[1], step=1)
+            t_outputs2 = model(inputs[1], step=2)
+            s_outputs = torch.cat([s_outputs1, s_outputs2]) # model output
+            t_outputs = torch.cat([t_outputs1, t_outputs2]) # model output
 
         if len(targets) == 3:
-            loss = mixup_criterion(criterion, outputs, targets[0], targets[1], targets[2]).mean()
+            s_loss = mixup_criterion(criterion, s_outputs, targets[0], targets[1], targets[2]).mean()
+            t_loss = mixup_criterion(criterion, t_outputs, targets[0], targets[1], targets[2]).mean()
             targets = targets[0]
+            s_pseudo_label = s_outputs.argmax(axis=1)
+            t_pseudo_label = t_outputs.argmax(axis=1)
+            s_cps_loss = criterion(s_outputs, t_pseudo_label).mean()
+            t_cps_loss = criterion(t_outputs, s_pseudo_label).mean()
         else:
-            loss = criterion(outputs, targets).mean()
+            s_loss = criterion(s_outputs, targets).mean()
+            t_loss = criterion(t_outputs, targets).mean()
+            s_pseudo_label = s_outputs.argmax(axis=1)
+            t_pseudo_label = t_outputs.argmax(axis=1)
+            s_cps_loss = criterion(s_outputs, t_pseudo_label).mean()
+            t_cps_loss = criterion(t_outputs, s_pseudo_label).mean()
 
         # measure accuracy and record loss
-        prec1, prec5 = accuracy(outputs.data, targets.data, topk=(1, 5))
-        losses.update(loss.item(), outputs.size(0))
-        top1.update(prec1.item(), outputs.size(0))
-        top5.update(prec5.item(), outputs.size(0))
+        s_prec1, s_prec5 = accuracy(s_outputs.data, targets.data, topk=(1, 5))
+        t_prec1, t_prec5 = accuracy(t_outputs.data, targets.data, topk=(1, 5))
+        s_losses.update(s_loss.item(), s_outputs.size(0))
+        t_losses.update(t_loss.item(), t_outputs.size(0))
+        s_cps_losses.update(s_cps_loss.item(), s_outputs.size(0))
+        t_cps_losses.update(t_cps_loss.item(), t_outputs.size(0))
+        s_top1.update(s_prec1.item(), s_outputs.size(0))
+        t_top1.update(t_prec1.item(), t_outputs.size(0))
+        s_top5.update(s_prec5.item(), s_outputs.size(0))
+        t_top5.update(t_prec5.item(), t_outputs.size(0))
 
         if mixbn:
             with torch.no_grad():
-                batch_size = outputs.size(0)
-                loss_main = criterion(outputs[:batch_size // 2], targets[:batch_size // 2]).mean()
-                loss_aux = criterion(outputs[batch_size // 2:], targets[batch_size // 2:]).mean()
-                prec1_main = accuracy(outputs.data[:batch_size // 2],
+                batch_size = s_outputs.size(0)
+                s_loss_main = criterion(s_outputs[:batch_size // 2], targets[:batch_size // 2]).mean()
+                s_loss_aux = criterion(s_outputs[batch_size // 2:], targets[batch_size // 2:]).mean()
+                s_prec1_main = accuracy(s_outputs.data[:batch_size // 2],
                                       targets.data[:batch_size // 2], topk=(1,))[0]
-                prec1_aux = accuracy(outputs.data[batch_size // 2:],
+                s_prec1_aux = accuracy(s_outputs.data[batch_size // 2:],
                                      targets.data[batch_size // 2:], topk=(1,))[0]
-            losses_main.update(loss_main.item(), batch_size // 2)
-            losses_aux.update(loss_aux.item(), batch_size // 2)
-            top1_main.update(prec1_main.item(), batch_size // 2)
-            top1_aux.update(prec1_aux.item(), batch_size // 2)
+
+                t_loss_main = criterion(t_outputs[:batch_size // 2], targets[:batch_size // 2]).mean()
+                t_loss_aux = criterion(t_outputs[batch_size // 2:], targets[batch_size // 2:]).mean()
+                t_prec1_main = accuracy(t_outputs.data[:batch_size // 2],
+                                      targets.data[:batch_size // 2], topk=(1,))[0]
+                t_prec1_aux = accuracy(t_outputs.data[batch_size // 2:],
+                                     targets.data[batch_size // 2:], topk=(1,))[0]
+
+            s_losses_main.update(s_loss_main.item(), batch_size // 2)
+            s_losses_aux.update(s_loss_aux.item(), batch_size // 2)
+            s_top1_main.update(s_prec1_main.item(), batch_size // 2)
+            s_top1_aux.update(s_prec1_aux.item(), batch_size // 2)
+
+            t_losses_main.update(t_loss_main.item(), batch_size // 2)
+            t_losses_aux.update(t_loss_aux.item(), batch_size // 2)
+            t_top1_main.update(t_prec1_main.item(), batch_size // 2)
+            t_top1_aux.update(t_prec1_aux.item(), batch_size // 2)
+
+
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
-        loss.backward()
+        s_loss.backward(retain_graph=True)
+        t_loss.backward(retain_graph=True)
+        s_cps_loss.backward()
+        t_cps_loss.backward()
         optimizer.step()
 
         # measure elapsed time
@@ -513,31 +590,51 @@ def train(train_loader, model, criterion, optimizer, epoch, use_cuda, warmup_sch
 
         # plot progress
         if not mixbn:
-            loss_str = "{:.4f}".format(losses.avg)
-            top1_str = "{:.4f}".format(top1.avg)
+            s_loss_str = "{:.4f}".format(s_losses.avg)
+            t_loss_str = "{:.4f}".format(t_losses.avg)
+            s_top1_str = "{:.4f}".format(s_top1.avg)
+            t_top1_str = "{:.4f}".format(t_top1.avg)
+
         else:
-            loss_str = "{:.2f}/{:.2f}/{:.2f}".format(losses.avg, losses_main.avg, losses_aux.avg)
-            top1_str = "{:.2f}/{:.2f}/{:.2f}".format(top1.avg, top1_main.avg, top1_aux.avg)
-        bar.suffix = '({batch}/{size}) Data: {data:.2f}s | Batch: {bt:.2f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:s} | top1: {top1:s} | top5: {top5: .1f}'.format(
+            # s_loss_str = "{:.2f}/{:.2f}/{:.2f}".format(s_losses.avg, s_losses_main.avg, s_losses_aux.avg)
+            # t_loss_str = "{:.2f}/{:.2f}/{:.2f}".format(t_losses.avg, t_losses_main.avg, t_losses_aux.avg)
+            s_loss_str = "{:.2f}".format(s_losses.avg)
+            t_loss_str = "{:.2f}".format(t_losses.avg)
+            s_cps_loss_str = "{:.2f}".format(s_cps_losses.avg)
+            t_cps_loss_str = "{:.2f}".format(t_cps_losses.avg)
+            # s_top1_str = "{:.2f}/{:.2f}/{:.2f}".format(s_top1.avg, s_top1_main.avg, s_top1_aux.avg)
+            # t_top1_str = "{:.2f}/{:.2f}/{:.2f}".format(t_top1.avg, t_top1_main.avg, t_top1_aux.avg)
+            s_top1_str = "{:.2f}".format(s_top1.avg)
+            t_top1_str = "{:.2f}".format(t_top1.avg)
+
+        bar.suffix = '({batch}/{size}) Data: {data:.2f}s | Batch: {bt:.2f}s | Total: {total:} | ETA: {eta:} | Loss_s: {s_loss:s} | Loss_t: {t_loss:s} | Loss_cps_s: {s_cps_loss:s} | Loss_cps_t: {t_cps_loss:s} | s_top1: {s_top1:s} | t_top1: {t_top1:s} | s_top5: {s_top5: .1f} | t_top5: {t_top5: .1f}'.format(
             batch=batch_idx + 1,
             size=len(train_loader),
             data=data_time.val,
             bt=batch_time.val,
             total=bar.elapsed_td,
             eta=bar.eta_td,
-            loss=loss_str,
-            top1=top1_str,
-            top5=top5.avg,
+            s_loss=s_loss_str,
+            t_loss=t_loss_str,
+            s_cps_loss=s_cps_loss_str,
+            t_cps_loss=t_cps_loss_str,
+            s_top1=s_top1_str,
+            t_top1=t_top1_str,
+            s_top5=s_top5.avg,
+            t_top5=t_top5.avg,
         )
         bar.next()
     bar.finish()
     if mixbn:
-        return losses.avg, top1.avg, losses_main.avg, losses_aux.avg, top1_main.avg, top1_aux.avg
+        result = ((s_losses.avg, s_cps_losses.avg, s_top1.avg, s_losses_main.avg, s_losses_aux.avg, s_top1_main.avg, s_top1_aux.avg),
+                 (t_losses.avg, t_cps_losses.avg, t_top1.avg, t_losses_main.avg, t_losses_aux.avg, t_top1_main.avg, t_top1_aux.avg))
+        return result
     else:
-        return losses.avg, top1.avg
+        result = (s_losses.avg, s_top1.avg), (t_losses.avg, t_top1.avg)
+        return result
 
 
-def test(val_loader, model, criterion, epoch, use_cuda, FGSM=False):
+def test(val_loader, model, step, criterion, epoch, use_cuda, FGSM=False):
     global best_acc
 
     batch_time = AverageMeter()
@@ -562,7 +659,7 @@ def test(val_loader, model, criterion, epoch, use_cuda, FGSM=False):
             mean = torch.tensor([0.485, 0.456, 0.406]).reshape(shape=(3, 1, 1)).cuda()
             std = torch.tensor([0.229, 0.224, 0.225]).reshape(shape=(3, 1, 1)).cuda()
             inputs.requires_grad = True
-            outputs = model(inputs)
+            outputs = model(inputs, step=step)
             loss = torch.nn.functional.nll_loss(outputs, targets)
             model.zero_grad()
             loss.backward()
@@ -574,7 +671,7 @@ def test(val_loader, model, criterion, epoch, use_cuda, FGSM=False):
 
         # compute output
         with torch.no_grad():
-            outputs = model(inputs)
+            outputs = model(inputs, step=step)
             if args.imagenet_a:
                 outputs = outputs[:, indices_in_1k]
             loss = criterion(outputs, targets).mean()
@@ -631,11 +728,14 @@ def show_performance(distortion_name, model, criterion, start_epoch, use_cuda):
     return np.mean(errs)
 
 
-def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoint.pth.tar'):
+def save_checkpoint(state, is_best, is_shape, checkpoint='checkpoint', filename='checkpoint.pth.tar'):
     filepath = os.path.join(checkpoint, filename)
     torch.save(state, filepath)
     if is_best:
-        shutil.copyfile(filepath, os.path.join(checkpoint, 'model_best.pth.tar'))
+        if is_shape:
+            shutil.copyfile(filepath, os.path.join(checkpoint, 'shape_model_best.pth.tar'))
+        else:
+            shutil.copyfile(filepath, os.path.join(checkpoint, 'texture_model_best.pth.tar'))
 
 
 if __name__ == '__main__':
