@@ -1,8 +1,7 @@
 from torch.optim.lr_scheduler import _LRScheduler
 
 
-def adjust_learning_rate(optimizer, epoch, args, batch=None, nBatch=None):
-    global state
+def adjust_learning_rate(optimizer, epoch, args, state, batch=None, nBatch=None):
     if args.lr_schedule == 'cos':
         T_total = args.epochs * nBatch
         T_cur = (epoch % args.epochs) * nBatch + batch
@@ -14,6 +13,7 @@ def adjust_learning_rate(optimizer, epoch, args, batch=None, nBatch=None):
         raise NotImplementedError
     for param_group in optimizer.param_groups:
         param_group['lr'] = state['lr']
+    return state
 
 
 class WarmUpLR(_LRScheduler):
