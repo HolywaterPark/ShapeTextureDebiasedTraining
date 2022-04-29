@@ -4,7 +4,7 @@
 # tmp dirs and files
 checkpoint
 checkpoints
-data
+dataset
 cifar-debug.py
 test.eps
 dev

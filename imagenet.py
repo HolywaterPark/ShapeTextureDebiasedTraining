@@ -29,16 +29,15 @@ import torch.nn as nn
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
-import torch.utils.data as data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision
-from torch.optim.lr_scheduler import _LRScheduler
 
 import models.imagenet as customized_models
 from models.AdaIN import StyleTransfer
-
+from models.cps_network import CPSNetwork
+from models.infodrop_resnet import infodrop_resnet50
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
 from utils.imagenet_a import indices_in_1k
 from tensorboardX import SummaryWriter
@@ -137,6 +136,7 @@ parser.add_argument('--multi_grid', action='store_true',
                     help='use downsampled images as input of style transfer for speed up training process')
 parser.add_argument('--min_size', default=112, type=int,
                     help='the min size of down sampled images')
+parser.add_argument('--cps_weight', default=1.0, type=float)
 
 # Combine with other data augmentations
 parser.add_argument('--mixup', default=0., type=float,
@@ -160,6 +160,7 @@ state = {k: v for k, v in args._get_kwargs()}
 # Use CUDA
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
 use_cuda = torch.cuda.is_available()
+device = 'cuda' if use_cuda else 'cpu'
 
 # Random seed
 if args.manualSeed is None:
@@ -170,7 +171,7 @@ if use_cuda:
     torch.cuda.manual_seed_all(args.manualSeed)
 
 best_acc = 0  # best test accuracy
-
+cps_weight = args.cps_weight
 
 def main():
     global best_acc, state
@@ -209,41 +210,22 @@ def main():
         num_workers=args.workers, pin_memory=True) if not args.evaluate_imagenet_c else None
 
     # create model
-    if args.arch.startswith('resnext'):
-        norm_layer = MixBatchNorm2d if args.mixbn else None
-        model = models.__dict__[args.arch](
-            baseWidth=args.base_width,
-            cardinality=args.cardinality,
-            num_classes=args.num_classes,
-            norm_layer=norm_layer
-        )
+    assert args.arch.startswith('resnet')
+    print("=> creating model '{}'".format(args.arch))
+    if args.mixbn:
+        norm_layer = MixBatchNorm2d
     else:
-        assert args.arch.startswith('resnet')
-        print("=> creating model '{}'".format(args.arch))
-        if args.mixbn:
-            norm_layer = MixBatchNorm2d
-        else:
-            norm_layer = None
-        # model = models.__dict__[args.arch](num_classes=args.num_classes, norm_layer=norm_layer)
-        t_model = torchvision.models.resnet50(num_classes=args.num_classes, norm_layer=norm_layer)
-        from models.infodrop_resnet import infodrop_resnet50
-        # s_model = torchvision.models.resnet50(num_classes=args.num_classes, norm_layer=norm_layer)
-        s_model = infodrop_resnet50(num_classes=args.num_classes, norm_layer=norm_layer)
-        # from models.resnet import resnet50
-        # s_model = torchvision.models.resnet50(num_classes=args.num_classes, norm_layer=norm_layer)
-
-
-    from models.cps_network import CPSNetwork
+        norm_layer = None
+    t_model = torchvision.models.resnet50(num_classes=args.num_classes, norm_layer=norm_layer)
+    s_model = infodrop_resnet50(num_classes=args.num_classes, norm_layer=norm_layer)
     network = CPSNetwork(s_model=s_model, t_model=t_model)
-    # model = torch.nn.DataParallel(model).cuda()
-    model = torch.nn.DataParallel(network).cuda()
-
+    model = torch.nn.DataParallel(network).to(device)
 
     cudnn.benchmark = True
     print('    Total params: %.2fM' % (sum(p.numel() for p in model.parameters()) / 1000000.0))
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss(reduction='none').cuda()
+    criterion = nn.CrossEntropyLoss(reduction='none').to(device)
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
     # Resume training
@@ -453,85 +435,36 @@ def train(train_loader, model, criterion, optimizer, epoch, use_cuda, warmup_sch
         t_top1_aux = AverageMeter()
     end = time.time()
 
-    MEAN = torch.tensor([0.485, 0.456, 0.406]).cuda()
-    STD = torch.tensor([0.229, 0.224, 0.225]).cuda()
+    MEAN = torch.tensor([0.485, 0.456, 0.406]).to(device)
+    STD = torch.tensor([0.229, 0.224, 0.225]).to(device)
     bar = Bar('Processing', max=len(train_loader))
     for batch_idx, (inputs, targets) in enumerate(train_loader):
         if epoch < args.warm:
             warmup_scheduler.step()
         elif args.lr_schedule == 'cos':
             adjust_learning_rate(optimizer, epoch, args, batch=batch_idx, nBatch=len(train_loader))
+        optimizer.zero_grad()
 
         # measure data loading time
         data_time.update(time.time() - end)
 
         if use_cuda:
-            inputs, targets = inputs.cuda(), targets.cuda(non_blocking=True)
+            inputs, targets = inputs.to(device), targets.cuda(non_blocking=True)
+        if args.mixup:
+            inputs, targets = mixup_data(inputs, targets, alpha=args.mixup, half=False)
+        elif args.cutmix:
+            inputs, targets = cutmix_data(inputs, targets, beta=args.cutmix, half=False)
 
-        if style_transfer is not None:
-            if args.multi_grid:
-                img_size = img_size_scheduler(batch_idx, epoch, args.schedule)
-                resized_inputs = torch.nn.functional.interpolate(inputs, size=img_size)
-                inputs_aux, targets_aux = style_transfer(resized_inputs, targets, replace=True)
-                inputs = (inputs, inputs_aux)
-                if len(targets_aux) == 3:
-                    n = targets.size(0)
-                    targets = (torch.cat([targets, targets_aux[0]]),
-                               torch.cat([torch.zeros(n, dtype=torch.long).cuda(), targets_aux[1]]),
-                               torch.cat([torch.zeros(n, dtype=torch.float).cuda(), targets_aux[2]]))
-                else:
-                    targets = torch.cat([targets, targets_aux])
-                if args.mixup:
-                    assert not args.cutmix
-                    inputs, targets = mixup_data(inputs, targets, alpha=args.mixup, half=True)
-                elif args.cutmix:
-                    inputs, targets = cutmix_data(inputs, targets, beta=args.cutmix, half=True)
-            else:
-                inputs, targets = style_transfer(inputs, targets, replace=False)
-                if args.mixup:
-                    assert not args.cutmix
-                    inputs, targets = mixup_data(inputs, targets, alpha=args.mixup, half=True)
-                elif args.cutmix:
-                    inputs, targets = cutmix_data(inputs, targets, beta=args.cutmix, half=True)
-        else:
-            if args.mixup:
-                inputs, targets = mixup_data(inputs, targets, alpha=args.mixup, half=False)
-            elif args.cutmix:
-                inputs, targets = cutmix_data(inputs, targets, beta=args.cutmix, half=False)
-
-        if not args.multi_grid:
-            inputs = (inputs - MEAN[:, None, None]) / STD[:, None, None]
-            s_outputs = model(inputs, step=1)
-            t_outputs = model(inputs, step=2)
-        else:
-            inputs = ((inputs[0] - MEAN[:, None, None]) / STD[:, None, None],
-                      (inputs[1] - MEAN[:, None, None]) / STD[:, None, None])
-            if args.mixbn:
-                model.apply(to_clean_status)
-            s_outputs1 = model(inputs[0], step=1)
-            t_outputs1 = model(inputs[0], step=2)
-            if args.mixbn:
-                model.apply(to_adv_status)
-            s_outputs2 = model(inputs[1], step=1)
-            t_outputs2 = model(inputs[1], step=2)
-            s_outputs = torch.cat([s_outputs1, s_outputs2]) # model output
-            t_outputs = torch.cat([t_outputs1, t_outputs2]) # model output
-
-        if len(targets) == 3:
-            s_loss = mixup_criterion(criterion, s_outputs, targets[0], targets[1], targets[2]).mean()
-            t_loss = mixup_criterion(criterion, t_outputs, targets[0], targets[1], targets[2]).mean()
-            targets = targets[0]
-            s_pseudo_label = s_outputs.argmax(axis=1)
-            t_pseudo_label = t_outputs.argmax(axis=1)
-            s_cps_loss = criterion(s_outputs, t_pseudo_label).mean()
-            t_cps_loss = criterion(t_outputs, s_pseudo_label).mean()
-        else:
-            s_loss = criterion(s_outputs, targets).mean()
-            t_loss = criterion(t_outputs, targets).mean()
-            s_pseudo_label = s_outputs.argmax(axis=1)
-            t_pseudo_label = t_outputs.argmax(axis=1)
-            s_cps_loss = criterion(s_outputs, t_pseudo_label).mean()
-            t_cps_loss = criterion(t_outputs, s_pseudo_label).mean()
+        inputs = (inputs - MEAN[:, None, None]) / STD[:, None, None]
+        s_outputs = model(inputs, step=1)
+        t_outputs = model(inputs, step=2)
+        
+        s_loss = criterion(s_outputs, targets).mean()
+        t_loss = criterion(t_outputs, targets).mean()
+        s_pseudo_label = s_outputs.argmax(axis=1)
+        t_pseudo_label = t_outputs.argmax(axis=1)
+        s_cps_loss = criterion(s_outputs, t_pseudo_label).mean()
+        t_cps_loss = criterion(t_outputs, s_pseudo_label).mean()
 
         # measure accuracy and record loss
         s_prec1, s_prec5 = accuracy(s_outputs.data, targets.data, topk=(1, 5))
@@ -572,14 +505,13 @@ def train(train_loader, model, criterion, optimizer, epoch, use_cuda, warmup_sch
             t_top1_main.update(t_prec1_main.item(), batch_size // 2)
             t_top1_aux.update(t_prec1_aux.item(), batch_size // 2)
 
-
+        sup_loss = s_loss + t_loss
+        cps_loss = s_cps_loss + t_cps_loss
+        
 
         # compute gradient and do SGD step
-        optimizer.zero_grad()
-        s_loss.backward(retain_graph=True)
-        t_loss.backward(retain_graph=True)
-        s_cps_loss.backward()
-        t_cps_loss.backward()
+        loss = sup_loss + cps_loss*args.cps_weight
+        loss.backward()
         optimizer.step()
 
         # measure elapsed time
@@ -651,11 +583,11 @@ def test(val_loader, model, step, criterion, epoch, use_cuda, FGSM=False):
         data_time.update(time.time() - end)
 
         if use_cuda:
-            inputs, targets = inputs.cuda(), targets.cuda()
+            inputs, targets = inputs.to(device), targets.to(device)
         inputs, targets = torch.autograd.Variable(inputs, volatile=True), torch.autograd.Variable(targets)
         if FGSM:
-            mean = torch.tensor([0.485, 0.456, 0.406]).reshape(shape=(3, 1, 1)).cuda()
-            std = torch.tensor([0.229, 0.224, 0.225]).reshape(shape=(3, 1, 1)).cuda()
+            mean = torch.tensor([0.485, 0.456, 0.406]).reshape(shape=(3, 1, 1)).to(device)
+            std = torch.tensor([0.229, 0.224, 0.225]).reshape(shape=(3, 1, 1)).to(device)
             inputs.requires_grad = True
             outputs = model(inputs, step=step)
             loss = torch.nn.functional.nll_loss(outputs, targets)

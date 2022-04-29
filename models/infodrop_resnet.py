@@ -89,39 +89,36 @@ class Info_Dropout(nn.Module):
         if finetune_wo_infodrop:
             return x
 
-        try:
-            with torch.no_grad():
-                distances = []
-                padded_x_old = self.padder(x_old)
-                sampled_i = torch.randint(-self.radius, self.radius + 1, size=(self.patch_sampling_num,)).tolist()
-                sampled_j = torch.randint(-self.radius, self.radius + 1, size=(self.patch_sampling_num,)).tolist()
-                for i, j in zip(sampled_i, sampled_j):
-                    tmp = padded_x_old[:, :, self.radius: -self.radius - 1, self.radius: -self.radius - 1] - \
-                        padded_x_old[:, :, self.radius + i: -self.radius - 1 + i,
-                        self.radius + j: -self.radius - 1 + j]
-                    distances.append(tmp.clone())
-                distance = torch.cat(distances, dim=1)
-                batch_size, _, h_dis, w_dis = distance.shape
-                distance = (distance**2).view(-1, self.indim, h_dis, w_dis).sum(dim=1).view(batch_size, -1, h_dis, w_dis)
-                distance = self.all_one_conv_indim_wise(distance)
-                distance = torch.exp(
-                    -distance / distance.mean() / 2 / self.band_width ** 2)  # using mean of distance to normalize
-                prob = (self.all_one_conv_radius_wise(distance) / self.patch_sampling_num) ** (1 / self.temperature)
+        with torch.no_grad():
+            distances = []
+            padded_x_old = self.padder(x_old)
+            sampled_i = torch.randint(-self.radius, self.radius + 1, size=(self.patch_sampling_num,)).tolist()
+            sampled_j = torch.randint(-self.radius, self.radius + 1, size=(self.patch_sampling_num,)).tolist()
+            for i, j in zip(sampled_i, sampled_j):
+                tmp = padded_x_old[:, :, self.radius: -self.radius - 1, self.radius: -self.radius - 1] - \
+                    padded_x_old[:, :, self.radius + i: -self.radius - 1 + i,
+                    self.radius + j: -self.radius - 1 + j]
+                distances.append(tmp.clone())
+            distance = torch.cat(distances, dim=1)
+            batch_size, _, h_dis, w_dis = distance.shape
+            distance = (distance**2).view(-1, self.indim, h_dis, w_dis).sum(dim=1).view(batch_size, -1, h_dis, w_dis)
+            distance = self.all_one_conv_indim_wise(distance)
+            distance = torch.exp(
+                -distance / distance.mean() / 2 / self.band_width ** 2)  # using mean of distance to normalize
+            prob = (self.all_one_conv_radius_wise(distance) / self.patch_sampling_num) ** (1 / self.temperature)
 
-                if self.if_pool:
-                    prob = -self.pool(-prob)  # min pooling of probability
-                prob /= prob.sum(dim=(-2, -1), keepdim=True)
+            if self.if_pool:
+                prob = -self.pool(-prob)  # min pooling of probability
+            
+            prob += 1e-8
+            prob /= prob.sum(dim=(-2, -1), keepdim=True)
 
+            batch_size, channels, h, w = x.shape
 
-                batch_size, channels, h, w = x.shape
+            random_choice = random_sample(prob, sampling_num=int(self.drop_rate * h * w))
 
-                random_choice = random_sample(prob, sampling_num=int(self.drop_rate * h * w))
-
-                random_mask = torch.ones((batch_size * channels, h * w), device=x.device)
-                random_mask[torch.arange(batch_size * channels, device=x.device).view(-1, 1), random_choice] = 0
-        except:
-            print('exception!!')
-            return x
+            random_mask = torch.ones((batch_size * channels, h * w), device=x.device)
+            random_mask[torch.arange(batch_size * channels, device=x.device).view(-1, 1), random_choice] = 0
 
         return x * random_mask.view(x.shape)
 
@@ -185,16 +182,12 @@ class BasicBlock(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         identity = x
-        except_flag = False
-        try:
-            x_old = x.clone()
-        except:
-            except_flag = True
+        x_old = x.clone()
         out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
 
-        if self.if_dropout and not except_flag:
+        if self.if_dropout:
             out = self.info_dropout1(x_old, out)
 
         out = self.conv2(out)
@@ -206,7 +199,7 @@ class BasicBlock(nn.Module):
         out += identity
         out = self.relu(out)
 
-        if self.downsample is None and self.if_dropout and not except_flag:
+        if self.downsample is None and self.if_dropout:
             out = self.info_dropout2(x_old, out)
 
         return out
@@ -257,23 +250,19 @@ class Bottleneck(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         identity = x
-        except_flag = False
-        try:
-            x_old = x.clone()
-        except:
-            except_flag = True
+        x_old = x.clone()
         out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
 
-        if self.if_dropout and not except_flag:
+        if self.if_dropout:
             out = self.info_dropout1(x_old, out)
 
         out = self.conv2(out)
         out = self.bn2(out)
         out = self.relu(out)
 
-        if self.downsample is None and self.if_dropout and not except_flag:
+        if self.downsample is None and self.if_dropout:
             out = self.info_dropout2(x_old, out)
             
         out = self.conv3(out)
@@ -398,17 +387,13 @@ class ResNet(nn.Module):
 
     def _forward_impl(self, x: Tensor) -> Tensor:
         # See note [TorchScript super()]
-        except_flag = False
-        try:
-            x_old = x.clone()
-        except:
-            except_flag = True
+        x_old = x.clone()
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
         x = self.maxpool(x)
 
-        if dropout_layers > 0 and not except_flag:
+        if dropout_layers > 0:
             x = self.info_dropout(x_old, x)
 
         x = self.layer1(x)
